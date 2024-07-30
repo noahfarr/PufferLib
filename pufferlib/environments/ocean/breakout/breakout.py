@@ -19,7 +19,7 @@ class PufferBreakout(pufferlib.PufferEnv):
         height: int = 720,
         horizon: int = 100,
         num_bricks: int = 112,
-        render_mode: str = "human",
+        render_mode: str = "rgb_array",
     ) -> None:
 
         self.width = width
@@ -27,9 +27,9 @@ class PufferBreakout(pufferlib.PufferEnv):
         self.grid = np.zeros((height, width), dtype=np.uint8)
         self.horizon = horizon
         self.num_bricks = num_bricks
-        self.paddle_position = np.zeros(2)
-        self.ball_position = np.zeros(2)
-        self.brick_states = np.zeros(num_bricks)
+        self.paddle_position = np.zeros(2, dtype=np.float32)
+        self.ball_position = np.zeros(2, dtype=np.float32)
+        self.brick_states = np.zeros(num_bricks, np.float32)
         self.c_env: CBreakout | None = None
         self.human_action = None
 
@@ -85,7 +85,7 @@ class PufferBreakout(pufferlib.PufferEnv):
     def reset(self, seed=None):
         if self.c_env is None:
             self.c_env = CBreakout(
-                observations=self.buf.observations,
+                observations=self.buf.observations[0],
                 rewards=self.buf.rewards,
                 paddle_position=self.paddle_position,
                 ball_position=self.ball_position,

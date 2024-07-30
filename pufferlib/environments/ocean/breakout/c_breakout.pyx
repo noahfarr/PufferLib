@@ -1,10 +1,10 @@
 # distutils: define_macros=NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
 # cython: language_level=3
-# cython: boundscheck=False
-# cython: initializedcheck=False
-# cython: wraparound=False
+# cython: boundscheck=True
+# cython: initializedcheck=True
+# cython: wraparound=True
 # cython: cdivision=True
-# cython: nonecheck=False
+# cython: nonecheck=True
 # cython: profile=False
 
 from libc.stdlib cimport rand
@@ -24,11 +24,12 @@ cdef class CBreakout:
         int horizon
         int obs_size
 
-        unsigned char[:, :] observations
+        unsigned char[:] observations
         float[:] rewards
-        double[:] ball_position
-        double[:] paddle_position
-        double[:] brick_states
+        float[:] ball_position
+        float[:] paddle_position
+        float[:] brick_states
+        int num_brick_states
 
 
     def __init__(self, cnp.ndarray observations, cnp.ndarray rewards, cnp.ndarray paddle_position, cnp.ndarray ball_position, cnp.ndarray brick_states, int width, int height, int horizon, int obs_size):
@@ -41,10 +42,17 @@ cdef class CBreakout:
         self.paddle_position = paddle_position
         self.ball_position = ball_position
         self.brick_states = brick_states
+        self.num_brick_states = brick_states.shape[0]
 
     cdef void compute_observations(self):
-        # self.observations[0, :] = np.concatenate((self.paddle_position, self.ball_position, self.brick_states))
-        pass
+        # Fix these casts so the data ranges make sense
+        self.observations[0] = <unsigned char>(self.paddle_position[0])
+        self.observations[1] = <unsigned char>(self.paddle_position[1])
+        self.observations[2] = <unsigned char>(self.ball_position[0])
+        self.observations[4] = <unsigned char>(self.ball_position[1])
+        #cdef int i
+        #for i in range(self.num_brick_states):
+        #    self.observations[3 + i] = <unsigned char>(self.brick_states[i])
 
     def reset(self, seed=0):
         self.paddle_position[0] = self.width / 2.0
