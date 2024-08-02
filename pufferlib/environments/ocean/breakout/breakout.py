@@ -15,28 +15,46 @@ class PufferBreakout(pufferlib.PufferEnv):
 
     def __init__(
         self,
-        width: int = 1280,
-        height: int = 720,
-        horizon: int = 100,
-        num_bricks: int = 112,
-        render_mode: str = "rgb_array",
+        width: int = 480,
+        height: int = 576,
+        num_brick_rows: int = 8,
+        num_brick_cols: int = 14,
+        brick_reward: float = 1,
+        report_interval: int = 128,
+        render_mode: str = "human",
     ) -> None:
 
         self.width = width
         self.height = height
-        self.grid = np.zeros((height, width), dtype=np.uint8)
-        self.horizon = horizon
-        self.num_bricks = num_bricks
+        self.num_brick_rows = num_brick_rows
+        self.num_brick_cols = num_brick_cols
+        self.num_bricks = num_brick_rows * num_brick_cols
+        self.brick_reward = brick_reward
+        self.report_interval = report_interval
+
         self.paddle_position = np.zeros(2, dtype=np.float32)
         self.ball_position = np.zeros(2, dtype=np.float32)
-        self.brick_states = np.zeros(num_bricks, np.float32)
+        self.ball_velocity = np.zeros(2, dtype=np.float32)
+        self.brick_states = np.zeros(self.num_bricks, np.float32)
+
         self.c_env: CBreakout | None = None
         self.human_action = None
+        self.tick = 0
+        self.reward_sum = 0
+
+        self.paddle_width: int = 50
+        self.paddle_height: int = 8
+        self.ball_radius: int = 4
+        self.brick_width: int = self.width // self.num_brick_cols
+        self.brick_height: int = 8
+        self.brick_positions = self.generate_brick_positions()
 
         # This block required by advanced PufferLib env spec
-        self.obs_size = 2 + 2 + num_bricks
-        low = np.array([0.0] * 2 + [0.0] * 2 + [0.0] * num_bricks)
-        high = np.array([width, height] + [width, height] + [1.0] * num_bricks)
+        self.obs_size = 2 + 2 + self.num_bricks
+        low = np.array([0.0] * 2 + [0.0] * 2 + [0.0] * 2 + [0.0] * self.num_bricks)
+        high = np.array(
+            [width, height] + [width, height] + [2.0] * 2 + [1.0] * self.num_bricks
+        )
         self.observation_space = gymnasium.spaces.Box(
             low=low, high=high, dtype=np.uint8
         )
@@ -63,7 +81,18 @@ class PufferBreakout(pufferlib.PufferEnv):
         elif render_mode == "rgb_array":
             self.client = render.RGBArrayRender()
         elif render_mode == "human":
-            self.client = RaylibClient(self.width, self.height)
+            self.client = RaylibClient(
+                self.width,
+                self.height,
+                self.num_brick_rows,
+                self.num_brick_cols,
+                self.brick_positions,
+                self.paddle_width,
+                self.paddle_height,
+                self.ball_radius,
+                self.brick_width,
+                self.brick_height,
+            )
         else:
             raise ValueError(f"Invalid render mode: {render_mode}")
 
@@ -73,13 +102,22 @@ class PufferBreakout(pufferlib.PufferEnv):
 
         self.actions = actions
         self.c_env.step(actions)
-        infos = {}
+
+        if self.ball_position[1] > self.height:
+            self.done = True
+
+        info = {}
+        self.reward_sum += self.buf.rewards.mean()
+
+        if self.tick % self.report_interval == 0:
+            info = {"rewards": self.reward_sum / self.report_interval}
+            self.reward_sum = 0
         return (
             self.buf.observations,
             self.buf.rewards,
             self.buf.terminals,
             self.buf.truncations,
-            infos,
+            info,
         )
 
     def reset(self, seed=None):
@@ -87,13 +125,24 @@ class PufferBreakout(pufferlib.PufferEnv):
             self.c_env = CBreakout(
                 observations=self.buf.observations[0],
                 rewards=self.buf.rewards,
+                done=self.done,
                 paddle_position=self.paddle_position,
                 ball_position=self.ball_position,
+                ball_velocity=self.ball_velocity,
+                brick_positions=self.brick_positions,
                 brick_states=self.brick_states,
                 width=self.width,
                 height=self.height,
-                horizon=self.horizon,
                 obs_size=self.obs_size,
+                num_bricks=self.num_bricks,
+                num_brick_rows=self.num_brick_rows,
+                num_brick_cols=self.num_brick_cols,
+                paddle_width=self.paddle_width,
+                paddle_height=self.paddle_height,
+                ball_radius=self.ball_radius,
+                brick_width=self.brick_width,
+                brick_height=self.brick_height,
+                brick_reward=self.brick_reward,
             )
 
         self.done = False
@@ -118,7 +167,10 @@ class PufferBreakout(pufferlib.PufferEnv):
             self.human_action = action
 
             return self.client.render(
-                self.paddle_position, self.ball_position, self.brick_states
+                self.paddle_position,
+                self.ball_position,
+                self.brick_states,
+                self.buf.rewards[0],
             )
         else:
             raise ValueError(f"Invalid render mode: {self.render_mode}")
@@ -126,17 +178,56 @@ class PufferBreakout(pufferlib.PufferEnv):
     def close(self):
         pass
 
+    def generate_brick_positions(self):
+        brick_positions = np.zeros((self.num_bricks, 2), dtype=np.float32)
+        y_offset = 30
+        for row in range(self.num_brick_rows):
+            for col in range(self.num_brick_cols):
+                idx = row * self.num_brick_cols + col
+                x = col * self.brick_width
+                y = row * self.brick_height + y_offset
+                brick_positions[idx][0] = x
+                brick_positions[idx][1] = y
+        return brick_positions
+
 
 class RaylibClient:
-    def __init__(self, width: int, height: int) -> None:
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        num_brick_rows: int,
+        num_brick_cols: int,
+        brick_positions: np.ndarray,
+        paddle_width: int,
+        paddle_height: int,
+        ball_radius: float,
+        brick_width: int,
+        brick_height: int,
+    ) -> None:
         self.width = width
         self.height = height
-        self.ball_radius = 5
-        self.paddle_width = 60
-        self.paddle_height = 10
-        self.brick_width = 50
-        self.brick_height = 20
+        self.ball_radius = ball_radius
+        self.paddle_width = paddle_width
+        self.paddle_height = paddle_height
+        self.brick_width = brick_width
+        self.brick_height = brick_height
+        self.num_brick_rows = num_brick_rows
+        self.num_brick_cols = num_brick_cols
+        self.brick_positions = brick_positions
+
         self.running = False
+
+        self.BRICK_COLORS = [
+            colors.RED,
+            colors.RED,
+            colors.ORANGE,
+            colors.ORANGE,
+            colors.GREEN,
+            colors.GREEN,
+            colors.YELLOW,
+            colors.YELLOW,
+        ]
 
         # Initialize raylib window
         rl.InitWindow(width, height, "PufferLib Ray Breakout".encode())
@@ -147,6 +238,7 @@ class RaylibClient:
         paddle_position: np.ndarray,
         ball_position: np.ndarray,
         brick_states: np.ndarray,
+        score: float,
     ) -> None:
         rl.BeginDrawing()
         rl.ClearBackground(render.PUFF_BACKGROUND)
@@ -154,8 +246,8 @@ class RaylibClient:
         # Draw the paddle
         paddle_x, paddle_y = paddle_position
         rl.DrawRectangle(
-            int(paddle_x - self.paddle_width // 2),
-            int(self.height - self.paddle_height - 10),
+            int(paddle_x),
+            int(paddle_y),
             self.paddle_width,
             self.paddle_height,
             colors.DARKGRAY,
@@ -165,20 +257,26 @@ class RaylibClient:
         ball_x, ball_y = ball_position
         rl.DrawCircle(int(ball_x), int(ball_y), self.ball_radius, colors.WHITE)
 
-        # # Draw the bricks
-        # rows = 8
-        # cols = 14
-        # for row in range(rows):
-        #     for col in range(cols):
-        #         state = brick_states[(row * cols + col)]
-        #         rl.DrawRectangle(
-        #             col * self.brick_width,
-        #             row * self.brick_height,
-        #             self.brick_width,
-        #             self.brick_height,
-        #             colors.RED,
-        #         )
+        # Draw the bricks
+        for row in range(self.num_brick_rows):
+            for col in range(self.num_brick_cols):
+                idx = row * self.num_brick_cols + col
+                if brick_states[idx] == 1:
+                    continue
 
+                x, y = self.brick_positions[idx]
+                brick_color = self.BRICK_COLORS[row]
+                rl.DrawRectangle(
+                    int(x),
+                    int(y),
+                    self.brick_width,
+                    self.brick_height,
+                    brick_color,
+                )
+
+        # Draw Score
+        text = f"Score: {int(score)}".encode("ascii")
+        rl.DrawText(text, 10, 10, 20, colors.WHITE)
         rl.EndDrawing()
 
     def close(self) -> None:
