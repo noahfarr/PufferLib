@@ -95,7 +95,7 @@ cdef class CBreakout:
         self.brick_height = brick_height
         self.brick_reward = brick_reward
         self.ball_fired = False
-        self.ball_speed = 3
+        self.ball_speed = 4
         self.score = 0.0
 
     cdef void compute_observations(self):
@@ -116,7 +116,7 @@ cdef class CBreakout:
         self.paddle_position[1] = self.height - self.paddle_height - 10
 
         self.ball_position[0] = self.paddle_position[0] + (self.paddle_width // 2 - self.ball_width // 2)
-        self.ball_position[1] = self.paddle_position[1] - self.ball_height
+        self.ball_position[1] = self.paddle_position[1] - self.ball_height - 10
 
         self.ball_velocity[0] = 0.0
         self.ball_velocity[1] = 0.0
@@ -131,19 +131,20 @@ cdef class CBreakout:
 
     def step(self, np_actions):
         cdef int action, i
-        cdef float score, angle
+        cdef float score, direction
 
         action = np_actions[0]
         if action == NOOP:
             pass
-        elif action == FIRE:
-            if not self.ball_fired:
-                self.ball_fired = True
+        elif action == FIRE and not self.ball_fired:
+            self.ball_fired = True
 
-                # TODO: Improve logic for where to shoot ball
-                angle = np.pi / 6
-                self.ball_velocity[0] = np.cos(angle) * self.ball_speed * (-1 if (self.paddle_position[0] + self.paddle_width//2 < self.width//2) else 1)
-                self.ball_velocity[1] = np.sin(angle) * self.ball_speed
+            direction = np.pi / 6
+
+            self.ball_velocity[0] = (-np.sin(direction) if self.paddle_position[0] + self.paddle_width // 2 < self.width // 2
+                                     else np.sin(direction)) * self.ball_speed
+
+            self.ball_velocity[1] = -np.cos(direction) * self.ball_speed
         elif action == LEFT:
             if not self.paddle_position[0] <= 0:
                 self.paddle_position[0] -= 2
@@ -152,7 +153,7 @@ cdef class CBreakout:
                 self.paddle_position[0] += 2
 
         if not self.ball_fired:
-            self.ball_position[0] = self.paddle_position[0] + self.paddle_width // 2
+            self.ball_position[0] = self.paddle_position[0] + self.paddle_width // 2 - self.ball_width // 2
 
         self.handle_collisions()
 
@@ -167,6 +168,7 @@ cdef class CBreakout:
         cdef int row, velocity_index, wall_width, wall_height
         cdef float[:, :] wall_positions
         cdef float[:] wall_position
+        cdef float relative_intersection, direction
 
         cdef int[:] wall_widths, wall_heights, velocity_indices
 
@@ -187,8 +189,14 @@ cdef class CBreakout:
 
         # Paddle Ball Collisions
         if self.check_collision(self.paddle_position, self.paddle_width, self.paddle_height, self.ball_position, self.ball_width, self.ball_height):
-            # TODO: Improve collision resolution
-            self.ball_velocity[1] *= -1
+            relative_intersection = (self.paddle_position[0] + self.paddle_width//2) - (self.ball_position[0] + self.ball_width//2)
+            relative_intersection = relative_intersection / (self.paddle_width // 2)
+            direction = relative_intersection * np.pi/4
+
+            self.ball_velocity[0] = np.sin(direction) * self.ball_speed
+            self.ball_velocity[1] = -np.cos(direction) * self.ball_speed
+
+
 
         # Brick Ball Collisions
         for i in range(self.num_bricks):
@@ -197,8 +205,16 @@ cdef class CBreakout:
 
             if self.check_collision(self.brick_positions[i], self.brick_width, self.brick_height, self.ball_position, self.ball_width, self.ball_height):
                 self.brick_states[i] = 1
-                # TODO: Improve collision resolution
-                self.ball_velocity[1] *= -1
+
+                # Determine collision direction and invert velocity accordingly
+                if (self.ball_position[1] + self.ball_height <= self.brick_positions[i][1] + (self.brick_height / 2)) or \
+                    (self.ball_position[1] >= self.brick_positions[i][1] + (self.brick_height / 2)):
+                    # Vertical collision
+                    self.ball_velocity[1] *= -1
+                elif (self.ball_position[0] + self.ball_width <= self.brick_positions[i][0] + (self.brick_width / 2)) or \
+                        (self.ball_position[0] >= self.brick_positions[i][0] + (self.brick_width / 2)):
+                    # Horizontal collision
+                    self.ball_velocity[0] *= -1
 
                 row = i // self.num_brick_cols
                 self.score += 7 - 2 * (row // 2)
