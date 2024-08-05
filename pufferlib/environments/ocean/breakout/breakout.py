@@ -23,9 +23,10 @@ class PufferBreakout(pufferlib.PufferEnv):
         report_interval: int = 128,
         render_mode: str = "human",
     ) -> None:
-
+        render_mode = "human"
         self.width = width
         self.height = height
+        self.grid = [np.zeros((height, width), dtype=np.uint8)]
         self.num_brick_rows = num_brick_rows
         self.num_brick_cols = num_brick_cols
         self.num_bricks = num_brick_rows * num_brick_cols
@@ -149,7 +150,7 @@ class PufferBreakout(pufferlib.PufferEnv):
             )
 
         self.done = False
-        self.c_env.reset(seed=seed)
+        self.c_env.reset()
         return self.buf.observations, {}
 
     def render(self):

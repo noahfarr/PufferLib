@@ -2,10 +2,10 @@ import pufferlib.emulation
 import pufferlib.postprocess
 
 
-def make_breakout():
+def make_breakout(num_envs=1, render_mode="rgb_array"):
     from .breakout import breakout
 
-    return breakout.PufferBreakout()
+    return breakout.PufferBreakout(render_mode=render_mode)
 
 
 def make_moba(
