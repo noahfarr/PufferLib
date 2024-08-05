@@ -45,8 +45,8 @@ class PufferBreakout(pufferlib.PufferEnv):
 
         self.paddle_width: int = 50
         self.paddle_height: int = 8
-        self.ball_width: int = 4
-        self.ball_height: int = 4
+        self.ball_width: int = 8
+        self.ball_height: int = 8
         self.brick_width: int = self.width // self.num_brick_cols
         self.brick_height: int = 8
         self.brick_positions = self.generate_brick_positions()
@@ -106,7 +106,10 @@ class PufferBreakout(pufferlib.PufferEnv):
         self.actions = actions
         self.c_env.step(actions)
 
-        if self.ball_position[1] > self.height:
+        if (
+            self.ball_position[1] > self.paddle_position[1] + self.paddle_height
+            or self.buf.rewards[0] == 448
+        ):
             self.done = True
 
         info = {}

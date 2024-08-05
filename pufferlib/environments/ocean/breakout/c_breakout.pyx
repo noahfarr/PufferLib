@@ -171,13 +171,13 @@ cdef class CBreakout:
 
         # Paddle Ball Collisions
         if self.check_collision(self.paddle_position, self.paddle_width, self.paddle_height, self.ball_position, self.ball_width, self.ball_height):
+
             relative_intersection = (self.paddle_position[0] + self.paddle_width//2) - (self.ball_position[0] + self.ball_width//2)
             relative_intersection = relative_intersection / (self.paddle_width // 2)
             direction = relative_intersection * pi/4
 
             self.ball_velocity[0] = sin(direction) * self.ball_speed
             self.ball_velocity[1] = -cos(direction) * self.ball_speed
-
 
 
         # Brick Ball Collisions
