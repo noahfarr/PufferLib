@@ -238,6 +238,7 @@ setup(
         "pufferlib/extensions.pyx",
         "pufferlib/environments/ocean/grid/c_grid.pyx",
         "pufferlib/environments/ocean/snake/c_snake.pyx",
+        "pufferlib/environments/ocean/breakout/c_breakout.pyx",
         "pufferlib/environments/ocean/moba/c_moba.pyx",
         "pufferlib/environments/ocean/moba/c_precompute_pathing.pyx",
     ], 

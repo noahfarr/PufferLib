@@ -291,3 +291,26 @@ class RaylibClient:
 
     def close(self) -> None:
         rl.close_window()
+
+def test_performance(timeout=10, atn_cache=1024):
+    env = PufferBreakout()
+    env.reset()
+    tick = 0
+
+    actions = np.random.randint(0, 4, atn_cache)
+
+    import time
+    start = time.time()
+    while time.time() - start < timeout:
+        idx = tick % atn_cache
+        atns = actions[idx: idx+1]
+        env.step(atns)
+        tick += 1
+
+    print(f'SPS: %f', tick / (time.time() - start))
+
+if __name__ == '__main__':
+    test_performance()
+
+
+

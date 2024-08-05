@@ -106,7 +106,8 @@ cdef class CBreakout:
 
         self.compute_observations()
 
-    def step(self, long[:] np_actions):
+    def step(self, cnp.ndarray actions):
+        cdef long[:] np_actions = actions
         cdef int action, i
         cdef float score, direction
 
