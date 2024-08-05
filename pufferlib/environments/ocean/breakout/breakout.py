@@ -44,7 +44,8 @@ class PufferBreakout(pufferlib.PufferEnv):
 
         self.paddle_width: int = 50
         self.paddle_height: int = 8
-        self.ball_radius: int = 4
+        self.ball_width: int = 4
+        self.ball_height: int = 4
         self.brick_width: int = self.width // self.num_brick_cols
         self.brick_height: int = 8
         self.brick_positions = self.generate_brick_positions()
@@ -89,7 +90,8 @@ class PufferBreakout(pufferlib.PufferEnv):
                 self.brick_positions,
                 self.paddle_width,
                 self.paddle_height,
-                self.ball_radius,
+                self.ball_width,
+                self.ball_height,
                 self.brick_width,
                 self.brick_height,
             )
@@ -139,7 +141,8 @@ class PufferBreakout(pufferlib.PufferEnv):
                 num_brick_cols=self.num_brick_cols,
                 paddle_width=self.paddle_width,
                 paddle_height=self.paddle_height,
-                ball_radius=self.ball_radius,
+                ball_width=self.ball_width,
+                ball_height=self.ball_height,
                 brick_width=self.brick_width,
                 brick_height=self.brick_height,
                 brick_reward=self.brick_reward,
@@ -201,13 +204,15 @@ class RaylibClient:
         brick_positions: np.ndarray,
         paddle_width: int,
         paddle_height: int,
-        ball_radius: float,
+        ball_width: float,
+        ball_height: float,
         brick_width: int,
         brick_height: int,
     ) -> None:
         self.width = width
         self.height = height
-        self.ball_radius = ball_radius
+        self.ball_width = ball_width
+        self.ball_height = ball_height
         self.paddle_width = paddle_width
         self.paddle_height = paddle_height
         self.brick_width = brick_width
@@ -255,7 +260,9 @@ class RaylibClient:
 
         # Draw the ball
         ball_x, ball_y = ball_position
-        rl.DrawCircle(int(ball_x), int(ball_y), self.ball_radius, colors.WHITE)
+        rl.DrawRectangle(
+            int(ball_x), int(ball_y), self.ball_width, self.ball_height, colors.WHITE
+        )
 
         # Draw the bricks
         for row in range(self.num_brick_rows):

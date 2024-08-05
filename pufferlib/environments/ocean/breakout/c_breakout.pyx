@@ -31,7 +31,9 @@ cdef class CBreakout:
         int num_brick_cols
         int paddle_width
         int paddle_height
-        int ball_radius
+        int ball_width
+        int ball_height
+        float ball_speed
         int brick_width
         int brick_height
         float brick_reward
@@ -61,7 +63,8 @@ cdef class CBreakout:
             int height,
             int paddle_width,
             int paddle_height,
-            int ball_radius,
+            int ball_width,
+            int ball_height,
             int brick_width,
             int brick_height,
             int obs_size,
@@ -86,11 +89,13 @@ cdef class CBreakout:
         self.num_brick_cols = num_brick_cols
         self.paddle_width = paddle_width
         self.paddle_height = paddle_height
-        self.ball_radius = ball_radius
+        self.ball_width = ball_width
+        self.ball_height = ball_height
         self.brick_width = brick_width
         self.brick_height = brick_height
         self.brick_reward = brick_reward
         self.ball_fired = False
+        self.ball_speed = 3
         self.score = 0.0
 
     cdef void compute_observations(self):
@@ -110,8 +115,8 @@ cdef class CBreakout:
         self.paddle_position[0] = self.width / 2.0 - self.paddle_width // 2
         self.paddle_position[1] = self.height - self.paddle_height - 10
 
-        self.ball_position[0] = self.paddle_position[0] + self.paddle_width // 2
-        self.ball_position[1] = self.paddle_position[1] - self.paddle_height // 2 - self.ball_radius // 2
+        self.ball_position[0] = self.paddle_position[0] + (self.paddle_width // 2 - self.ball_width // 2)
+        self.ball_position[1] = self.paddle_position[1] - self.ball_height
 
         self.ball_velocity[0] = 0.0
         self.ball_velocity[1] = 0.0
@@ -126,7 +131,7 @@ cdef class CBreakout:
 
     def step(self, np_actions):
         cdef int action, i
-        cdef float score
+        cdef float score, angle
 
         action = np_actions[0]
         if action == NOOP:
@@ -136,14 +141,15 @@ cdef class CBreakout:
                 self.ball_fired = True
 
                 # TODO: Improve logic for where to shoot ball
-                self.ball_velocity[0] = 2
-                self.ball_velocity[1] = -2
+                angle = np.pi / 6
+                self.ball_velocity[0] = np.cos(angle) * self.ball_speed * (-1 if (self.paddle_position[0] + self.paddle_width//2 < self.width//2) else 1)
+                self.ball_velocity[1] = np.sin(angle) * self.ball_speed
         elif action == LEFT:
-            self.paddle_position[0] -= 2
-            pass
+            if not self.paddle_position[0] <= 0:
+                self.paddle_position[0] -= 2
         elif action == RIGHT:
-            self.paddle_position[0] += 2
-            pass
+            if not self.paddle_position[0] + self.paddle_width >= self.width:
+                self.paddle_position[0] += 2
 
         if not self.ball_fired:
             self.ball_position[0] = self.paddle_position[0] + self.paddle_width // 2
@@ -158,21 +164,40 @@ cdef class CBreakout:
         self.compute_observations()
 
     cdef void handle_collisions(self):
-        cdef int row
-        self.handle_ball_wall_collisions()
-        # Paddle Ball Collision
-        if self.check_rectangle_circle_collision(self.paddle_position, self.paddle_width, self.paddle_height, self.ball_position, self.ball_radius):
-            self.ball_position[1] = self.paddle_position[1] - self.ball_radius
+        cdef int row, velocity_index, wall_width, wall_height
+        cdef float[:, :] wall_positions
+        cdef float[:] wall_position
+
+        cdef int[:] wall_widths, wall_heights, velocity_indices
+
+        wall_positions = np.array([[0.0, 0.0], [0.0, 0.0], [self.width, 0.0]], dtype=np.float32)
+        wall_widths = np.array([0, self.width, 0], dtype=np.int32)
+        wall_heights = np.array([self.height, 0, self.height], dtype=np.int32)
+        velocity_indices = np.array([0, 1, 0], dtype=np.int32)
+
+        # Wall Ball Collisions
+        for i in range(3):
+            wall_position = wall_positions[i]
+            wall_width = wall_widths[i]
+            wall_height = wall_heights[i]
+            velocity_index = velocity_indices[i]
+            if self.check_collision(wall_position, wall_width, wall_height, self.ball_position, self.ball_width, self.ball_height):
+                self.ball_velocity[velocity_index] *= -1
+
+
+        # Paddle Ball Collisions
+        if self.check_collision(self.paddle_position, self.paddle_width, self.paddle_height, self.ball_position, self.ball_width, self.ball_height):
+            # TODO: Improve collision resolution
             self.ball_velocity[1] *= -1
 
-        # Ball Brick Collisions
+        # Brick Ball Collisions
         for i in range(self.num_bricks):
             if self.brick_states[i] == 1:
                 continue
 
-            if self.check_rectangle_circle_collision(self.brick_positions[i], self.brick_width, self.brick_height, self.ball_position, self.ball_radius):
+            if self.check_collision(self.brick_positions[i], self.brick_width, self.brick_height, self.ball_position, self.ball_width, self.ball_height):
                 self.brick_states[i] = 1
-                # TODO: Improve behaviour for ball brick hits from side
+                # TODO: Improve collision resolution
                 self.ball_velocity[1] *= -1
 
                 row = i // self.num_brick_cols
@@ -180,65 +205,17 @@ cdef class CBreakout:
                 break
 
 
-    cdef bint check_rectangle_circle_collision(self, float[:] rectangle_position, int rectangle_width, int rectangle_height, float[:] circle_position, float circle_radius):
-        cdef float rectangle_left, rectangle_right, rectangle_top, rectangle_bottom
-        cdef float circle_left, circle_right, circle_top, circle_bottom
-        cdef float closest_x, closest_y, dx, dy, squared_distance, squared_radius
-        cdef bint overlaps
+    cdef bint check_collision(self, float[:] rectangle_position, int rectangle_width, int rectangle_height, float[:] other_position, int other_width, int other_height):
+        cdef float rectangle_left, rectangle_right, rectangle_top, rectangle_bottom, other_left, other_right, other_top, other_bottom
 
-        # Rectangle coordinates
         rectangle_left = rectangle_position[0]
         rectangle_right = rectangle_position[0] + rectangle_width
         rectangle_top = rectangle_position[1]
         rectangle_bottom = rectangle_position[1] + rectangle_height
 
-        # Circle bounding box coordinates
-        circle_left = circle_position[0] - circle_radius
-        circle_right = circle_position[0] + circle_radius
-        circle_bottom = circle_position[1] + circle_radius
-        circle_top = circle_position[1] - circle_radius
+        other_left = other_position[0]
+        other_right = other_position[0] + other_width
+        other_top = other_position[1]
+        other_bottom = other_position[1] + other_height
 
-        # Check for overlap
-        overlaps = (rectangle_right > circle_left and
-                        rectangle_left < circle_right and
-                        rectangle_top < circle_bottom and
-                        rectangle_bottom > circle_top)
-
-        if not overlaps:
-            # print("Does not overlap...")
-            return False
-
-
-        # Find the closest point on the rectangle to the circle's center
-        closest_x = max(rectangle_left, min(circle_position[0], rectangle_right))
-        closest_y = max(rectangle_top, min(circle_position[1], rectangle_bottom))
-
-        # Calculate squared distance from the closest point to the circle's center
-        dx = circle_position[0] - closest_x
-        dy = circle_position[1] - closest_y
-        squared_distance = dx * dx + dy * dy
-        squared_radius = circle_radius * circle_radius
-
-        return squared_distance < squared_radius
-
-
-    cdef void handle_ball_wall_collisions(self):
-        # Collision with the left wall
-        if self.ball_position[0] - self.ball_radius < 0:
-            self.ball_position[0] = self.ball_radius  # Correct ball position after collision
-            self.ball_velocity[0] *= -1
-
-        # Collision with the right wall
-        elif self.ball_position[0] + self.ball_radius > self.width:
-            self.ball_position[0] = self.width - self.ball_radius  # Correct ball position after collision
-            self.ball_velocity[0] *= -1
-
-        # Collision with the top wall
-        if self.ball_position[1] - self.ball_radius <= 0:
-            self.ball_position[1] = self.ball_radius  # Correct ball position after collision
-            self.ball_velocity[1] *= -1
-
-        # Collision with the bottom wall
-        elif self.ball_position[1] + self.ball_radius > self.height:
-            self.done = True
-            return
+        return rectangle_right > other_left and rectangle_left < other_right and rectangle_bottom > other_top and rectangle_top < other_bottom
