@@ -21,9 +21,8 @@ class PufferBreakout(pufferlib.PufferEnv):
         num_brick_cols: int = 14,
         brick_reward: float = 1,
         report_interval: int = 128,
-        render_mode: str = "human",
+        render_mode: str = "rgb_array",
     ) -> None:
-        render_mode = "human"
         self.width = width
         self.height = height
         self.grid = [np.zeros((height, width), dtype=np.uint8)]
