@@ -8,6 +8,10 @@ PLATFORM="$(uname -s)"
 SRC_DIR="pufferlib/ocean/$ENV"
 WEB_OUTPUT_DIR="build_web/$ENV"
 
+# cJSON paths
+CJSON_INCLUDE_DIR="/opt/homebrew/opt/cjson/include/cjson"  # Correct path to cJSON.h
+CJSON_LIB_DIR="/opt/homebrew/opt/cjson/lib"
+
 # Create build output directory
 mkdir -p "$WEB_OUTPUT_DIR"
 
@@ -20,7 +24,10 @@ if [ "$MODE" = "web" ]; then
         -Wall \
         ./raylib_wasm/lib/libraylib.a \
         -I./raylib_wasm/include \
-        -I./pufferlib\
+        -I./pufferlib \
+        -I"$CJSON_INCLUDE_DIR" \  # Include cJSON headers
+        -L"$CJSON_LIB_DIR" \  # Add cJSON library path
+        -lcjson \  # Link against cJSON
         -L. \
         -L./raylib_wasm/lib \
         -sASSERTIONS=2 \
@@ -44,13 +51,15 @@ FLAGS=(
     -Wall
     -I./raylib/include 
     -I./pufferlib
+    -I"$CJSON_INCLUDE_DIR"  # Correct cJSON include path
     "$SRC_DIR/$ENV.c" -o "$ENV"
     ./raylib/lib/libraylib.a
+    -L"$CJSON_LIB_DIR"  # Correct cJSON library path
+    -lcjson  # Link against cJSON
     -lm
     -lpthread
     -DPLATFORM_DESKTOP
 )
-
 
 if [ "$PLATFORM" = "Darwin" ]; then
     FLAGS+=(
