@@ -132,26 +132,53 @@ void render(pybind11::object pufferl_obj, int env_id) {
     static_vec_render(pufferl.vec, env_id);
 }
 
+// Overlap mode: wait out any in-flight collection but keep its data; the next
+// rollouts() call delivers it instead of re-collecting. Called before
+// operations that touch state the collection reads or writes (frozen bank
+// weights, agent perms, env tags/flags).
+static void join_pending_collection(PuffeRL& pufferl) {
+    if (pufferl.collect_pending) {
+        pybind11::gil_scoped_release no_gil;
+        static_vec_omp_join(pufferl.vec);
+        pufferl.collect_pending = false;
+        pufferl.collect_ready = true;
+    }
+}
+
 void rollouts(pybind11::object pufferl_obj) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
     pybind11::gil_scoped_release no_gil;
     double t0 = wall_clock();
 
-    // Zero state buffers (primary + every frozen bank, so all banks see fresh
-    // state symmetrically — otherwise frozen banks accumulate indefinitely while
-    // primary resets, giving primary an unfair in-distribution advantage).
-    if (pufferl.hypers.reset_state) {
-        for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
-            puf_zero(&pufferl.buffer_states[i], pufferl.default_stream);
-        }
-        for (int b = 0; b < pufferl.num_frozen_banks; b++) {
-            for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
-                puf_zero(&pufferl.frozen_banks[b].buffer_states[i], pufferl.default_stream);
-            }
-        }
+    // State zeroing covers the primary + every frozen bank, so all banks see
+    // fresh state symmetrically — otherwise frozen banks accumulate
+    // indefinitely while primary resets, giving primary an unfair
+    // in-distribution advantage.
+    if (!pufferl.hypers.overlap) {
+        // Synchronous path: zero states, collect a full horizon, return.
+        pufferl_zero_rollout_states(&pufferl);
+        static_vec_omp_step(pufferl.vec);
+    } else if (pufferl.collect_pending) {
+        // Pipelined path: the collection launched at the end of the previous
+        // rollouts() call ran concurrently with train(); just wait it out.
+        static_vec_omp_join(pufferl.vec);
+        pufferl.collect_pending = false;
+    } else if (pufferl.collect_ready) {
+        // A guard (selfplay swap, perm change, ...) already joined the
+        // in-flight collection; its data is sitting in the rollout buffers.
+        pufferl.collect_ready = false;
+    } else {
+        // Cold start: nothing in flight yet. Snapshot acting weights (a
+        // post-create load_weights may have changed the live params) and
+        // collect synchronously.
+        pufferl_snapshot_acting_weights(&pufferl);
+        pufferl_zero_rollout_states(&pufferl);
+        cudaStreamSynchronize(pufferl.default_stream);
+        static_vec_omp_step(pufferl.vec);
     }
 
-    static_vec_omp_step(pufferl.vec);
+    // In overlap mode this measures the stall waiting on the pipelined
+    // collection, i.e. the rollout time train() could not hide.
     float sec = (float)(wall_clock() - t0);
     pufferl.profile.accum[PROF_ROLLOUT] += sec * 1000.0f;  // store as ms
 
@@ -160,6 +187,20 @@ void rollouts(pybind11::object pufferl_obj) {
     pufferl.profile.accum[PROF_EVAL_GPU] += eval_prof[EVAL_GPU];
     pufferl.profile.accum[PROF_EVAL_ENV] += eval_prof[EVAL_ENV_STEP];
     pufferl.global_step += pufferl.hypers.horizon * pufferl.hypers.total_agents;
+
+    if (pufferl.hypers.overlap) {
+        // Stage this epoch's data out of the rollout buffers (train_impl will
+        // skip its own staging), snapshot the live weights for acting, and
+        // launch the next collection before returning. It runs on the buffer
+        // threads while the caller's train() updates the live weights.
+        stage_train_data(pufferl);
+        pufferl.train_data_staged = true;
+        pufferl_snapshot_acting_weights(&pufferl);
+        pufferl_zero_rollout_states(&pufferl);
+        cudaStreamSynchronize(pufferl.default_stream);
+        static_vec_omp_start(pufferl.vec);
+        pufferl.collect_pending = true;
+    }
 }
 
 pybind11::dict train(pybind11::object pufferl_obj) {
@@ -209,6 +250,7 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
         throw std::runtime_error("Failed to read weight file");
     }
     fclose(f);
+    join_pending_collection(pufferl);  // collection acts on a snapshot of these
     cudaMemcpy(pufferl.master_weights.data, buf.data(), nbytes, cudaMemcpyHostToDevice);
     if (USE_BF16) {
         int n = numel(pufferl.param_puf.shape);
@@ -225,6 +267,7 @@ int py_add_frozen_bank(py::object pufferl_obj, int slice_size,
 
 void py_load_frozen_bank(py::object pufferl_obj, int bank_idx, const std::string& path) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    join_pending_collection(pufferl);  // in-flight rollouts read bank weights
     pufferl_load_frozen_bank(&pufferl, bank_idx, path.c_str());
 }
 
@@ -235,6 +278,7 @@ void py_set_agent_perm(py::object pufferl_obj, py::array_t<int> perm) {
     if ((int)buf.shape[0] != pufferl.vec->total_agents) {
         throw std::runtime_error("agent_perm length must equal total_agents");
     }
+    join_pending_collection(pufferl);  // rewires env slot pointers
     pufferl_set_agent_perm(&pufferl, (const int*)buf.ptr);
 }
 
@@ -246,11 +290,13 @@ void py_set_env_tags(py::object pufferl_obj, py::array_t<int> tags) {
     if ((int)buf.shape[0] != num_envs) {
         throw std::runtime_error("env_tags length must equal num_envs");
     }
+    join_pending_collection(pufferl);  // env threads write these structs
     pufferl_set_env_tags(&pufferl, (const int*)buf.ptr);
 }
 
 int py_count_aligned(py::object pufferl_obj, int tag_value, int reset_flags) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    join_pending_collection(pufferl);  // reads/resets per-env boundary flags
     return pufferl_count_aligned(&pufferl, tag_value, reset_flags);
 }
 
@@ -431,6 +477,9 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     hypers.prio_alpha = get_config(train_kwargs, "prio_alpha");
     hypers.prio_beta0 = get_config(train_kwargs, "prio_beta0");
     hypers.reset_state = get_config(args, "reset_state");
+    // Rollout/train overlap (optional key for configs predating it)
+    hypers.overlap = train_kwargs.contains("overlap")
+        ? (bool)get_config(train_kwargs, "overlap") : false;
     // Base-level config ([base] section becomes top-level in args)
     hypers.cudagraphs = get_config(args, "cudagraphs");
     hypers.profile = get_config(args, "profile");

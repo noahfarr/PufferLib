@@ -302,6 +302,11 @@ typedef struct {
     bool reset_state;
     int cudagraphs;
     bool profile;
+    // Rollout/train overlap: collect the next batch on the env buffer threads
+    // while train_impl runs on the previous one. Rollout forwards read a
+    // weight snapshot taken at epoch boundary (one update stale; corrected by
+    // the PPO ratio + V-Trace rho/c clips that are already in the loss).
+    bool overlap;
     // Multi-GPU
     int rank;
     int world_size;
@@ -382,6 +387,17 @@ typedef struct {
     // worker thread only writes inside its own physical chunk.
     // Bank 0 = primary (learner). NULL = no layout set (primary owns full chunk).
     int* bank_layout;
+    // Rollout/train overlap (hypers.overlap). Rollout forwards read
+    // acting_weights — a flat snapshot of param_puf taken once per epoch — so
+    // train_impl can update the live params concurrently without torn reads.
+    // Registered with the same policy_weights_create order as the primary, so a
+    // flat param_puf copy aligns every tensor.
+    PolicyWeights acting_weights;
+    Allocator acting_params_alloc;
+    PrecisionTensor acting_param_puf;
+    bool collect_pending;    // a collection is in flight on the buffer threads
+    bool collect_ready;      // a joined collection sits undelivered in rollouts
+    bool train_data_staged;  // train_rollouts already holds this epoch's data
 } PuffeRL;
 
 Dict* log_environments_impl(PuffeRL& pufferl) {
@@ -644,7 +660,9 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         PrecisionTensor* s_bank;
         if (b == 0) {
             p_bank = &pufferl->policy;
-            w_bank = &pufferl->weights;
+            // Overlap mode: act with the per-epoch weight snapshot so a
+            // concurrent train_impl can't produce torn weight reads.
+            w_bank = hypers.overlap ? &pufferl->acting_weights : &pufferl->weights;
             a_bank = &pufferl->buffer_activations[buf];
             s_bank = &pufferl->buffer_states[buf];
         } else {
@@ -1471,17 +1489,15 @@ inline float cosine_annealing(float lr_base, float lr_min, long t, long T) {
     return lr_min + 0.5f*(lr_base - lr_min)*(1.0f + std::cos(M_PI * ratio));
 }
 
-void train_impl(PuffeRL& pufferl) {
-    // Update to HypersT& p
-    HypersT& hypers = pufferl.hypers;
-
-    cudaEventRecord(pufferl.profile.events[0]);  // pre-loop start
+// Transpose rollout layout (T, B, ...) into train layout (B, T, ...), clamp
+// rewards, and reset importance ratios. Reads pufferl.rollouts, writes
+// pufferl.train_rollouts. Synchronous mode: called inline by train_impl.
+// Overlap mode: called from rollouts() right after joining a collection, so
+// the next collection can overwrite pufferl.rollouts while train_impl runs.
+void stage_train_data(PuffeRL& pufferl) {
     cudaStream_t train_stream = pufferl.default_stream;
-
-    // Transpose from rollout layout (T, B, ...) to train layout (B, T, ...)
     RolloutBuf& src = pufferl.rollouts;
     RolloutBuf& rollouts = pufferl.train_rollouts;
-    PrecisionTensor& advantages_puf = pufferl.advantages_puf;
 
     int T = src.observations.shape[0], B = src.observations.shape[1];
     int obs_size = (ndim(src.observations.shape) >= 3) ? src.observations.shape[2] : 1;
@@ -1514,6 +1530,48 @@ void train_impl(PuffeRL& pufferl) {
     // Set importance weights to 1.0
     fill_precision_kernel<<<grid_size(numel(rollouts.ratio.shape)), BLOCK_SIZE, 0, train_stream>>>(
         rollouts.ratio.data, from_float(1.0f), numel(rollouts.ratio.shape));
+}
+
+// Overlap mode: copy the live params into the acting snapshot. Called from
+// rollouts() between joining the previous collection and launching the next,
+// i.e. never concurrent with a rollout forward or a train_impl.
+extern "C" void pufferl_snapshot_acting_weights(PuffeRL* pufferl) {
+    if (!pufferl->hypers.overlap) return;
+    cudaMemcpyAsync(pufferl->acting_param_puf.data, pufferl->param_puf.data,
+        numel(pufferl->acting_param_puf.shape) * sizeof(precision_t),
+        cudaMemcpyDeviceToDevice, pufferl->default_stream);
+}
+
+// Zero rollout recurrent state for the primary and every frozen bank (no-op
+// unless hypers.reset_state). Queued on default_stream; callers must sync
+// before the buffer threads start the next collection.
+extern "C" void pufferl_zero_rollout_states(PuffeRL* pufferl) {
+    if (!pufferl->hypers.reset_state) return;
+    for (int i = 0; i < pufferl->hypers.num_buffers; i++) {
+        puf_zero(&pufferl->buffer_states[i], pufferl->default_stream);
+    }
+    for (int b = 0; b < pufferl->num_frozen_banks; b++) {
+        for (int i = 0; i < pufferl->hypers.num_buffers; i++) {
+            puf_zero(&pufferl->frozen_banks[b].buffer_states[i], pufferl->default_stream);
+        }
+    }
+}
+
+void train_impl(PuffeRL& pufferl) {
+    // Update to HypersT& p
+    HypersT& hypers = pufferl.hypers;
+
+    cudaStream_t train_stream = pufferl.default_stream;
+    cudaEventRecord(pufferl.profile.events[0], train_stream);  // pre-loop start
+
+    RolloutBuf& rollouts = pufferl.train_rollouts;
+    PrecisionTensor& advantages_puf = pufferl.advantages_puf;
+
+    if (pufferl.train_data_staged) {
+        pufferl.train_data_staged = false;  // staged by rollouts() (overlap mode)
+    } else {
+        stage_train_data(pufferl);
+    }
 
     // Inline any of these only used once
     int minibatch_size = hypers.minibatch_size;
@@ -1529,7 +1587,10 @@ void train_impl(PuffeRL& pufferl) {
     if (anneal_lr) {
         float lr_min = hypers.min_lr_ratio * hypers.lr;
         float lr = cosine_annealing(hypers.lr, lr_min, current_epoch, total_epochs);
-        cudaMemcpy(muon->lr_ptr, &lr, sizeof(float), cudaMemcpyHostToDevice);
+        // Async on train_stream: a null-stream memcpy would rendezvous with the
+        // blocking rollout streams (stalls the pipelined collection).
+        cudaMemcpyAsync(muon->lr_ptr, &lr, sizeof(float),
+            cudaMemcpyHostToDevice, train_stream);
     }
 
     // Annealed entropy coefficient — same cosine shape as lr. With PG signal
@@ -1546,11 +1607,11 @@ void train_impl(PuffeRL& pufferl) {
     // Annealed priority exponent
     float anneal_beta = prio_beta0 + (1.0f - prio_beta0) * prio_alpha * (float)current_epoch/(float)total_epochs;
     TrainGraph& graph = pufferl.train_buf;
-    cudaEventRecord(pufferl.profile.events[1]);  // pre-loop end
+    cudaEventRecord(pufferl.profile.events[1], train_stream);  // pre-loop end
 
     int total_minibatches = hypers.replay_ratio * batch_size / hypers.minibatch_size;
     for (int mb = 0; mb < total_minibatches; ++mb) {
-        cudaEventRecord(pufferl.profile.events[2]);  // start of misc (overwritten each iter)
+        cudaEventRecord(pufferl.profile.events[2], train_stream);  // start of misc (overwritten each iter)
         puf_zero(&advantages_puf, train_stream);
 
         profile_begin("compute_advantage", hypers.profile);
@@ -1585,7 +1646,7 @@ void train_impl(PuffeRL& pufferl) {
         }
         profile_end(hypers.profile);
 
-        cudaEventRecord(pufferl.profile.events[3]);  // end misc / start forward
+        cudaEventRecord(pufferl.profile.events[3], train_stream);  // end misc / start forward
         profile_begin("train_forward_backward", hypers.profile);
         if (pufferl.train_captured) {
             cudaGraphLaunch(pufferl.train_cudagraph, train_stream);
@@ -1653,7 +1714,7 @@ void train_impl(PuffeRL& pufferl) {
                 (char*)rollouts.values.data, pufferl.prio_bufs.idx.data,
                 (const char*)graph.mb_newvalue.data, num_idx, row_bytes);
         }
-        cudaEventRecord(pufferl.profile.events[4]);  // end forward
+        cudaEventRecord(pufferl.profile.events[4], train_stream);  // end forward
     }
     pufferl.epoch += 1;
 
@@ -1914,6 +1975,14 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
 
     cudaSetDevice(hypers.gpu_id);
 
+    // Overlap mode: train work must NOT run on the legacy null stream — null
+    // stream ops rendezvous with the (blocking) per-buffer rollout streams,
+    // which would serialize train against the in-flight collection. Give the
+    // main thread its own non-blocking stream instead.
+    if (hypers.overlap) {
+        cudaStreamCreateWithFlags(&pufferl->default_stream, cudaStreamNonBlocking);
+    }
+
     // Multi-GPU: initialize NCCL
     if (hypers.world_size > 1) {
         if (hypers.nccl_id.size() != sizeof(ncclUniqueId))
@@ -1989,6 +2058,21 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
 
     // Buffers for weights, grads, and activations
     pufferl->weights = policy_weights_create(&pufferl->policy, params);
+
+    // Overlap mode: acting snapshot the rollout forwards read while train_impl
+    // updates the live params. Same policy_weights_create registration order as
+    // the primary, so a flat param_puf copy aligns every tensor. Allocated
+    // before warmup capture so the rollout cudagraphs bake in its pointers.
+    if (hypers.overlap) {
+        Allocator* acting_params = &pufferl->acting_params_alloc;
+        pufferl->acting_weights = policy_weights_create(&pufferl->policy, acting_params);
+        if (alloc_create(acting_params) != cudaSuccess) {
+            return nullptr;
+        }
+        pufferl->acting_param_puf = {.data = (precision_t*)acting_params->mem,
+            .shape = {acting_params->total_elems}};
+    }
+
     pufferl->train_activations = policy_reg_train(&pufferl->policy, pufferl->weights, acts, grads, B_TT);
     pufferl->buffer_activations = (PolicyActivations*)calloc(num_buffers, sizeof(PolicyActivations));
     pufferl->buffer_states = (PrecisionTensor*)calloc(num_buffers, sizeof(PrecisionTensor));
@@ -2053,6 +2137,13 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         int n = numel(pufferl->param_puf.shape);
         cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
             pufferl->master_weights.data, pufferl->param_puf.data, n);
+    }
+
+    // Initial acting snapshot: queued on default_stream so it orders after the
+    // init/cast kernels above, then drained before anything reads it.
+    if (hypers.overlap) {
+        pufferl_snapshot_acting_weights(pufferl.get());
+        cudaStreamSynchronize(pufferl->default_stream);
     }
 
     // Per-buffer persistent RNG states
@@ -2197,6 +2288,12 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
 }
 
 void close_impl(PuffeRL& pufferl) {
+    // Overlap mode: a pipelined collection may still be running on the buffer
+    // threads; let it finish before tearing down the graphs/streams it uses.
+    if (pufferl.collect_pending) {
+        static_vec_omp_join(pufferl.vec);
+        pufferl.collect_pending = false;
+    }
     cudaDeviceSynchronize();
     if (pufferl.hypers.profile) {
         cudaProfilerStop();
@@ -2208,6 +2305,10 @@ void close_impl(PuffeRL& pufferl) {
     }
 
     policy_weights_free(&pufferl.policy, &pufferl.weights);
+    if (pufferl.hypers.overlap) {
+        policy_weights_free(&pufferl.policy, &pufferl.acting_weights);
+        alloc_free(&pufferl.acting_params_alloc);
+    }
     policy_activations_free(&pufferl.policy, pufferl.train_activations);
     for (int buf = 0; buf < pufferl.hypers.num_buffers; buf++) {
         policy_activations_free(&pufferl.policy, pufferl.buffer_activations[buf]);
@@ -2228,6 +2329,9 @@ void close_impl(PuffeRL& pufferl) {
 
     for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
         cudaStreamDestroy(pufferl.streams[i]);
+    }
+    if (pufferl.hypers.overlap && pufferl.default_stream != 0) {
+        cudaStreamDestroy(pufferl.default_stream);
     }
     for (int i = 0; i < NUM_TRAIN_EVENTS; i++) {
         cudaEventDestroy(pufferl.profile.events[i]);

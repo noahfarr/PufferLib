@@ -470,6 +470,9 @@ def eval(env_name, args=None, load_path=None):
     args = args or load_config(env_name)
     args['reset_state'] = False
     args['train']['horizon'] = 1
+    # Overlap pipelines collection one epoch ahead, which would let rendering
+    # and logs race the in-flight rollout; eval is synchronous.
+    args['train']['overlap'] = 0
 
     backend = _resolve_backend(args)
     pufferl = backend.create_pufferl(args)
@@ -502,6 +505,7 @@ def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, ver
     args = args or load_config(env_name)
     args['reset_state'] = False
     args['train']['horizon'] = 1
+    args['train']['overlap'] = 0  # match scores games synchronously
     args.setdefault('nccl_id', b'')  # match is always single-GPU
     # Sweep suggestions can give odd agents_per_buffer (e.g. num_buffers=5,
     # total_agents=4096 -> 819). Pin to a stable eval config that guarantees

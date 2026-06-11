@@ -119,6 +119,11 @@ void static_vec_eval_log(StaticVec* vec, Dict* out);
 void create_static_threads(StaticVec* vec, int num_threads, int horizon,
     void* ctx, net_callback_fn net_callback, thread_init_fn thread_init);
 void static_vec_omp_step(StaticVec* vec);
+// Split phases of omp_step for rollout/train overlap: start kicks every buffer
+// thread into a full-horizon collection and returns immediately; join blocks
+// until all buffers are back to waiting (and their GPU streams are synced).
+void static_vec_omp_start(StaticVec* vec);
+void static_vec_omp_join(StaticVec* vec);
 void static_vec_seq_step(StaticVec* vec);
 void static_vec_render(StaticVec* vec, int env_id);
 void static_vec_read_profile(StaticVec* vec, float out[NUM_EVAL_PROF]);
@@ -323,14 +328,23 @@ static void* static_omp_threadmanager(void* arg) {
     }
 }
 
-void static_vec_omp_step(StaticVec* vec) {
+void static_vec_omp_start(StaticVec* vec) {
     StaticThreading* threading = vec->threading;
     for (int buf = 0; buf < vec->buffers; buf++) {
         atomic_store(&threading->buffer_states[buf], OMP_RUNNING);
     }
+}
+
+void static_vec_omp_join(StaticVec* vec) {
+    StaticThreading* threading = vec->threading;
     for (int buf = 0; buf < vec->buffers; buf++) {
         while (atomic_load(&threading->buffer_states[buf]) != OMP_WAITING) {}
     }
+}
+
+void static_vec_omp_step(StaticVec* vec) {
+    static_vec_omp_start(vec);
+    static_vec_omp_join(vec);
 }
 
 void static_vec_seq_step(StaticVec* vec) {
